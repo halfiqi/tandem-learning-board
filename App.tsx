@@ -22,30 +22,38 @@ import { TandemLogo, INITIAL_POOL_CARDS } from './constants';
 import { BoardState, Card, CATEGORIES } from './types';
 import BoardRow from './components/BoardRow';
 import DraggableCard from './components/DraggableCard';
-import { Share2, Check, Download, Upload, X, Copy, Info, FilePlus, ExternalLink } from 'lucide-react';
+import { Share2, Check, Download, Upload, X, Copy, Info, FilePlus, ExternalLink, AlertCircle } from 'lucide-react';
 
 const isPoolTemplate = (id: string) => id.startsWith('p');
 const generateInstanceId = (baseId: string) => `inst-${baseId}-${Math.random().toString(36).substring(2, 9)}`;
 
+// Robust base64 for URLs
 const serializeBoard = (state: BoardState) => {
   try {
     const data = { c: state.classification, g: state.grid };
-    return btoa(unescape(encodeURIComponent(JSON.stringify(data))))
+    const json = JSON.stringify(data);
+    return btoa(unescape(encodeURIComponent(json)))
       .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-  } catch { return null; }
+  } catch (e) { 
+    console.error("Failed to serialize board", e);
+    return null; 
+  }
 };
 
 const deserializeBoard = (encoded: string): Partial<BoardState> | null => {
   try {
     const base64 = encoded.replace(/-/g, '+').replace(/_/g, '/');
-    const data = JSON.parse(decodeURIComponent(escape(atob(base64))));
+    const json = decodeURIComponent(escape(atob(base64)));
+    const data = JSON.parse(json);
     return { classification: data.c, grid: data.g };
-  } catch { return null; }
+  } catch (e) { 
+    console.error("Failed to deserialize board", e);
+    return null; 
+  }
 };
 
 const App: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement>(null);
-  
   const [board, setBoard] = useState<BoardState>(() => {
     const params = new URLSearchParams(window.location.search);
     const shared = params.get('b');
@@ -198,7 +206,9 @@ const App: React.FC = () => {
     const data = JSON.stringify({ c: board.classification, g: board.grid }, null, 2);
     const url = URL.createObjectURL(new Blob([data], { type: 'application/json' }));
     const a = document.createElement('a');
-    a.href = url; a.download = 'tandem-architect-board.json'; a.click();
+    a.href = url; 
+    a.download = `tandem-board-${new Date().toISOString().split('T')[0]}.json`; 
+    a.click();
     URL.revokeObjectURL(url);
   };
 
@@ -210,7 +220,7 @@ const App: React.FC = () => {
       try {
         const json = JSON.parse(re.target?.result as string);
         if (json.c && json.g) setBoard({ classification: json.c, grid: json.g, pool: INITIAL_POOL_CARDS });
-      } catch { alert("Invalid file."); }
+      } catch { alert("Invalid file format."); }
     };
     reader.readAsText(file);
     e.target.value = '';
@@ -218,16 +228,32 @@ const App: React.FC = () => {
 
   const boardCode = useMemo(() => serializeBoard(board), [board]);
   const shareLink = useMemo(() => {
-    const url = new URL(window.location.href);
+    // If we are in a blob environment, we can't generate a stable URL
+    if (window.location.protocol === 'blob:') return "Links disabled in preview windows";
+    const url = new URL(window.location.origin + window.location.pathname);
     if (boardCode) url.searchParams.set('b', boardCode);
     return url.toString();
   }, [boardCode]);
 
-  const copy = (txt: string, type: 'link' | 'code') => {
-    navigator.clipboard.writeText(txt).then(() => {
+  const copyToClipboard = async (txt: string, type: 'link' | 'code') => {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(txt);
+      } else {
+        // Fallback for older browsers/non-secure contexts
+        const textArea = document.createElement("textarea");
+        textArea.value = txt;
+        document.body.appendChild(textArea);
+        textArea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textArea);
+      }
       setCopiedType(type);
       setTimeout(() => setCopiedType(null), 2000);
-    });
+    } catch (err) {
+      console.error('Failed to copy: ', err);
+      alert("Failed to copy. Please manually select the text and copy.");
+    }
   };
 
   const activeCard = useMemo(() => {
@@ -235,6 +261,8 @@ const App: React.FC = () => {
     if (isPoolTemplate(activeId)) return INITIAL_POOL_CARDS.find(c => c.id === activeId) || null;
     return [...board.classification, ...Object.values(board.grid).flatMap(r => Object.values(r).flat())].find(c => c.id === activeId) || null;
   }, [activeId, board]);
+
+  const isBlobPreview = window.location.protocol === 'blob:';
 
   return (
     <div className="min-h-screen bg-[#f1f5f9] flex flex-col">
@@ -289,8 +317,8 @@ const App: React.FC = () => {
       </div>
 
       {showShareModal && (
-        <div className="fixed inset-0 z-[200] bg-[#1e2d4d]/70 backdrop-blur-xl flex items-center justify-center p-8 animate-in fade-in duration-500">
-          <div className="bg-white w-full max-w-2xl rounded-[4rem] shadow-2xl p-14 relative animate-in zoom-in duration-500">
+        <div className="fixed inset-0 z-[200] bg-[#1e2d4d]/70 backdrop-blur-xl flex items-center justify-center p-8 animate-in fade-in duration-300">
+          <div className="bg-white w-full max-w-2xl rounded-[4rem] shadow-2xl p-14 relative animate-in zoom-in duration-300">
             <button onClick={() => setShowShareModal(false)} className="absolute top-10 right-10 p-4 text-gray-400 hover:bg-gray-100 rounded-full transition-colors"><X className="w-7 h-7" /></button>
             
             <div className="mb-12 text-center">
@@ -299,22 +327,50 @@ const App: React.FC = () => {
             </div>
 
             <div className="space-y-10">
+              {/* Conditional Warning for Blob Previews */}
+              {isBlobPreview && (
+                <div className="p-6 bg-amber-50 border border-amber-200 rounded-[2rem] flex gap-4">
+                  <AlertCircle className="w-6 h-6 text-amber-600 shrink-0" />
+                  <div className="space-y-2">
+                    <h4 className="text-sm font-black text-amber-800 uppercase tracking-widest">Preview Mode Active</h4>
+                    <p className="text-xs text-amber-700 leading-relaxed">
+                      You are running in a temporary preview environment. <strong>Share Links will not work</strong> until you deploy to GitHub Pages.
+                      Please use the <strong>Export Board</strong> option below instead.
+                    </p>
+                  </div>
+                </div>
+              )}
+
               <div className="group">
-                <label className="text-[11px] font-black uppercase tracking-[0.3em] text-gray-400 mb-4 block group-hover:text-[#1e6fb3] transition-colors">Direct Link (Best for Web)</label>
+                <label className="text-[11px] font-black uppercase tracking-[0.3em] text-gray-400 mb-4 block group-hover:text-[#1e6fb3] transition-colors">Direct Link (GitHub Pages Only)</label>
                 <div className="flex gap-4">
-                  <input readOnly value={shareLink} className="flex-1 bg-gray-50 border border-gray-200 rounded-3xl px-7 py-5 text-sm text-gray-600 outline-none focus:ring-4 focus:ring-[#1e6fb3]/10" />
-                  <button onClick={() => copy(shareLink, 'link')} className={`px-10 rounded-3xl transition-all shadow-xl ${copiedType === 'link' ? 'bg-green-500 text-white' : 'bg-[#1e6fb3] text-white hover:bg-[#165a94] transform active:scale-95'}`}>
+                  <input readOnly value={shareLink} disabled={isBlobPreview} className="flex-1 bg-gray-50 border border-gray-200 rounded-3xl px-7 py-5 text-sm text-gray-600 outline-none focus:ring-4 focus:ring-[#1e6fb3]/10 disabled:opacity-50" />
+                  <button 
+                    disabled={isBlobPreview}
+                    onClick={() => copyToClipboard(shareLink, 'link')} 
+                    className={`px-10 rounded-3xl transition-all shadow-xl disabled:bg-gray-200 disabled:shadow-none ${copiedType === 'link' ? 'bg-green-500 text-white' : 'bg-[#1e6fb3] text-white hover:bg-[#165a94] transform active:scale-95'}`}>
                     {copiedType === 'link' ? <Check className="w-6 h-6" /> : <Copy className="w-6 h-6" />}
                   </button>
                 </div>
               </div>
 
-              <div className="p-8 bg-[#f8fafc] rounded-[2.5rem] border border-gray-100">
-                <label className="text-[11px] font-black uppercase tracking-[0.3em] text-[#1e6fb3] mb-4 block">Board Transfer ID (For Preview Mode)</label>
-                <div className="flex gap-4">
-                  <input readOnly value={boardCode || ''} className="flex-1 bg-white border border-gray-200 rounded-2xl px-7 py-5 text-sm font-mono outline-none" />
-                  <button onClick={() => copy(boardCode || '', 'code')} className={`px-10 rounded-2xl transition-all shadow-xl ${copiedType === 'code' ? 'bg-green-500 text-white' : 'bg-[#1e6fb3] text-white hover:bg-[#165a94] transform active:scale-95'}`}>
-                    {copiedType === 'code' ? <Check className="w-6 h-6" /> : <Copy className="w-6 h-6" />}
+              <div className="p-8 bg-[#f8fafc] rounded-[2.5rem] border border-gray-100 space-y-4">
+                <div className="flex justify-between items-center">
+                  <label className="text-[11px] font-black uppercase tracking-[0.3em] text-[#1e6fb3]">Reliable Sharing Options</label>
+                  <span className="text-[10px] bg-[#1e6fb3]/10 text-[#1e6fb3] px-3 py-1 rounded-full font-bold uppercase tracking-widest">Recommended</span>
+                </div>
+                
+                <div className="grid grid-cols-2 gap-4">
+                  <button onClick={exportJson} className="flex flex-col items-center justify-center p-6 bg-white border border-gray-200 rounded-3xl hover:border-[#1e6fb3] hover:shadow-xl transition-all group">
+                    <Download className="w-8 h-8 text-gray-400 group-hover:text-[#1e6fb3] mb-3" />
+                    <span className="text-xs font-black uppercase tracking-widest text-gray-600">Download .json</span>
+                    <span className="text-[9px] text-gray-400 mt-1">Best for backup & file share</span>
+                  </button>
+                  
+                  <button onClick={() => copyToClipboard(boardCode || '', 'code')} className="flex flex-col items-center justify-center p-6 bg-white border border-gray-200 rounded-3xl hover:border-[#1e6fb3] hover:shadow-xl transition-all group">
+                    {copiedType === 'code' ? <Check className="w-8 h-8 text-green-500 mb-3" /> : <Copy className="w-8 h-8 text-gray-400 group-hover:text-[#1e6fb3] mb-3" />}
+                    <span className="text-xs font-black uppercase tracking-widest text-gray-600">{copiedType === 'code' ? 'Copied!' : 'Copy Board ID'}</span>
+                    <span className="text-[9px] text-gray-400 mt-1">Transfer code for team</span>
                   </button>
                 </div>
               </div>
