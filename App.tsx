@@ -1,0 +1,335 @@
+
+import React, { useState, useCallback, useMemo, useRef, useEffect } from 'react';
+import {
+  DndContext,
+  DragOverlay,
+  closestCenter,
+  KeyboardSensor,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  DragStartEvent,
+  DragOverEvent,
+  DragEndEvent,
+} from '@dnd-kit/core';
+import {
+  arrayMove,
+  SortableContext,
+  sortableKeyboardCoordinates,
+  verticalListSortingStrategy,
+} from '@dnd-kit/sortable';
+import { TandemLogo, INITIAL_POOL_CARDS } from './constants';
+import { BoardState, Card, CATEGORIES } from './types';
+import BoardRow from './components/BoardRow';
+import DraggableCard from './components/DraggableCard';
+import { Share2, Check, Download, Upload, X, Copy, Info, FilePlus, ExternalLink } from 'lucide-react';
+
+const isPoolTemplate = (id: string) => id.startsWith('p');
+const generateInstanceId = (baseId: string) => `inst-${baseId}-${Math.random().toString(36).substring(2, 9)}`;
+
+const serializeBoard = (state: BoardState) => {
+  try {
+    const data = { c: state.classification, g: state.grid };
+    return btoa(unescape(encodeURIComponent(JSON.stringify(data))))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  } catch { return null; }
+};
+
+const deserializeBoard = (encoded: string): Partial<BoardState> | null => {
+  try {
+    const base64 = encoded.replace(/-/g, '+').replace(/_/g, '/');
+    const data = JSON.parse(decodeURIComponent(escape(atob(base64))));
+    return { classification: data.c, grid: data.g };
+  } catch { return null; }
+};
+
+const App: React.FC = () => {
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  
+  const [board, setBoard] = useState<BoardState>(() => {
+    const params = new URLSearchParams(window.location.search);
+    const shared = params.get('b');
+    if (shared) {
+      const decoded = deserializeBoard(shared);
+      if (decoded) return { ...decoded, pool: INITIAL_POOL_CARDS } as BoardState;
+    }
+    const saved = localStorage.getItem('tandem_architect_v3');
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        return { ...parsed, pool: INITIAL_POOL_CARDS };
+      } catch {}
+    }
+    return {
+      classification: [],
+      grid: { strategy: {}, mechanics: {}, ux: {}, theme: {} },
+      pool: INITIAL_POOL_CARDS,
+    };
+  });
+
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [showShareModal, setShowShareModal] = useState(false);
+  const [copiedType, setCopiedType] = useState<'link' | 'code' | null>(null);
+
+  useEffect(() => {
+    localStorage.setItem('tandem_architect_v3', JSON.stringify({ c: board.classification, g: board.grid }));
+  }, [board.classification, board.grid]);
+
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
+  );
+
+  const findContainer = useCallback((id: string, currentState: BoardState) => {
+    if (id === 'pool' || currentState.pool.some(c => c.id === id)) return { row: 'pool' };
+    if (id === 'classification' || currentState.classification.some(c => c.id === id)) return { row: 'classification' };
+    if (id.includes('::')) {
+      const [row, col] = id.split('::');
+      return { row, col };
+    }
+    for (const [row, cols] of Object.entries(currentState.grid)) {
+      for (const [col, cards] of Object.entries(cols)) {
+        if (cards.some(c => c.id === id)) return { row, col };
+      }
+    }
+    return null;
+  }, []);
+
+  const handleDragStart = (e: DragStartEvent) => setActiveId(e.active.id as string);
+
+  const handleDragOver = (e: DragOverEvent) => {
+    const { active, over } = e;
+    if (!over || isPoolTemplate(active.id as string)) return;
+    const activeIdStr = active.id as string;
+    const overIdStr = over.id as string;
+
+    setBoard(prev => {
+      const activeLoc = findContainer(activeIdStr, prev);
+      const overLoc = findContainer(overIdStr, prev);
+      if (!activeLoc || !overLoc || (activeLoc.row === overLoc.row && activeLoc.col === overLoc.col)) return prev;
+
+      const activeCard = activeLoc.row === 'classification'
+        ? prev.classification.find(c => c.id === activeIdStr)
+        : prev.grid[activeLoc.row!]?.[activeLoc.col!]?.find(c => c.id === activeIdStr);
+
+      if (!activeCard) return prev;
+      const next = { ...prev, grid: { ...prev.grid }, classification: [...prev.classification] };
+      
+      if (activeLoc.row === 'classification') {
+        next.classification = next.classification.filter(c => c.id !== activeIdStr);
+      } else if (activeLoc.col) {
+        next.grid[activeLoc.row!] = { ...next.grid[activeLoc.row!], [activeLoc.col!]: next.grid[activeLoc.row!][activeLoc.col!].filter(c => c.id !== activeIdStr) };
+      }
+
+      if (overLoc.row === 'classification') {
+        next.classification.push(activeCard);
+      } else if (overLoc.col) {
+        next.grid[overLoc.row!] = { ...next.grid[overLoc.row!], [overLoc.col!]: [...(next.grid[overLoc.row!][overLoc.col!] || []), activeCard] };
+      }
+      return next;
+    });
+  };
+
+  const handleDragEnd = (e: DragEndEvent) => {
+    const { active, over } = e;
+    const activeIdStr = active.id as string;
+    if (!over) { setActiveId(null); return; }
+
+    setBoard(prev => {
+      const overLoc = findContainer(over.id as string, prev);
+      const next = { ...prev };
+
+      if (isPoolTemplate(activeIdStr)) {
+        if (overLoc && overLoc.row !== 'pool') {
+          const original = INITIAL_POOL_CARDS.find(c => c.id === activeIdStr);
+          if (original) {
+            const instance = { ...original, id: generateInstanceId(activeIdStr) };
+            if (overLoc.row === 'classification') {
+              next.classification = [...next.classification, instance];
+            } else if (overLoc.col) {
+              next.grid[overLoc.row!] = { ...next.grid[overLoc.row!], [overLoc.col!]: [...(next.grid[overLoc.row!][overLoc.col!] || []), instance] };
+            }
+          }
+        }
+      } else {
+        const activeLoc = findContainer(activeIdStr, prev);
+        if (activeLoc && overLoc && activeLoc.row === overLoc.row && activeLoc.col === overLoc.col) {
+          if (activeLoc.row === 'classification') {
+            const oldIdx = next.classification.findIndex(c => c.id === activeIdStr);
+            const newIdx = next.classification.findIndex(c => c.id === (over.id as string));
+            next.classification = arrayMove(next.classification, oldIdx, newIdx);
+          } else if (activeLoc.col) {
+            const cards = [...(next.grid[activeLoc.row!][activeLoc.col!] || [])];
+            const oldIdx = cards.findIndex(c => c.id === activeIdStr);
+            const newIdx = cards.findIndex(c => c.id === (over.id as string));
+            next.grid[activeLoc.row!] = { ...next.grid[activeLoc.row!], [activeLoc.col!]: arrayMove(cards, oldIdx, newIdx) };
+          }
+        }
+      }
+      return next;
+    });
+    setActiveId(null);
+  };
+
+  const deleteCard = useCallback((cardId: string, rowId: string, colId?: string) => {
+    setBoard(prev => {
+      const next = { ...prev, grid: { ...prev.grid }, classification: [...prev.classification] };
+      if (rowId === 'classification') {
+        next.classification = next.classification.filter(c => c.id !== cardId);
+        Object.keys(next.grid).forEach(r => { delete next.grid[r][cardId]; });
+      } else if (colId) {
+        next.grid[rowId] = { ...next.grid[rowId], [colId]: next.grid[rowId][colId]?.filter(c => c.id !== cardId) || [] };
+      }
+      return next;
+    });
+  }, []);
+
+  const resetBoard = () => {
+    if (!confirm("Clear this entire board?")) return;
+    setBoard({
+      classification: [],
+      grid: { strategy: {}, mechanics: {}, ux: {}, theme: {} },
+      pool: INITIAL_POOL_CARDS
+    });
+    window.history.replaceState({}, '', window.location.pathname);
+  };
+
+  const exportJson = () => {
+    const data = JSON.stringify({ c: board.classification, g: board.grid }, null, 2);
+    const url = URL.createObjectURL(new Blob([data], { type: 'application/json' }));
+    const a = document.createElement('a');
+    a.href = url; a.download = 'tandem-architect-board.json'; a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const importJson = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (re) => {
+      try {
+        const json = JSON.parse(re.target?.result as string);
+        if (json.c && json.g) setBoard({ classification: json.c, grid: json.g, pool: INITIAL_POOL_CARDS });
+      } catch { alert("Invalid file."); }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  };
+
+  const boardCode = useMemo(() => serializeBoard(board), [board]);
+  const shareLink = useMemo(() => {
+    const url = new URL(window.location.href);
+    if (boardCode) url.searchParams.set('b', boardCode);
+    return url.toString();
+  }, [boardCode]);
+
+  const copy = (txt: string, type: 'link' | 'code') => {
+    navigator.clipboard.writeText(txt).then(() => {
+      setCopiedType(type);
+      setTimeout(() => setCopiedType(null), 2000);
+    });
+  };
+
+  const activeCard = useMemo(() => {
+    if (!activeId) return null;
+    if (isPoolTemplate(activeId)) return INITIAL_POOL_CARDS.find(c => c.id === activeId) || null;
+    return [...board.classification, ...Object.values(board.grid).flatMap(r => Object.values(r).flat())].find(c => c.id === activeId) || null;
+  }, [activeId, board]);
+
+  return (
+    <div className="min-h-screen bg-[#f1f5f9] flex flex-col">
+      <header className="sticky top-0 z-[100] bg-white border-b border-gray-200 px-8 py-5 flex justify-between items-center shadow-lg">
+        <div className="flex items-center gap-4">
+          <button onClick={resetBoard} className="p-3.5 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-2xl transition-all" title="Reset Board"><FilePlus className="w-6 h-6" /></button>
+          <div className="w-px h-10 bg-gray-200 mx-2" />
+          <button onClick={() => fileInputRef.current?.click()} className="flex items-center gap-2.5 px-6 py-3 text-xs font-black text-gray-500 hover:bg-gray-100 rounded-[1.2rem] transition-all uppercase tracking-widest border border-gray-100 shadow-sm"><Upload className="w-4 h-4" /> Import</button>
+          <button onClick={exportJson} className="flex items-center gap-2.5 px-6 py-3 text-xs font-black text-gray-500 hover:bg-gray-100 rounded-[1.2rem] transition-all uppercase tracking-widest border border-gray-100 shadow-sm"><Download className="w-4 h-4" /> Export</button>
+          <input ref={fileInputRef} type="file" accept=".json" onChange={importJson} className="hidden" />
+        </div>
+
+        <TandemLogo />
+
+        <button onClick={() => setShowShareModal(true)} className="flex items-center gap-3 px-10 py-4 bg-[#1e6fb3] text-white rounded-2xl font-black text-[13px] shadow-2xl hover:bg-[#165a94] transition-all uppercase tracking-[0.2em] transform active:scale-95">
+          <Share2 className="w-5 h-5" /> Share Game
+        </button>
+      </header>
+
+      <div className="flex-1 flex overflow-hidden">
+        <main className="flex-1 overflow-auto p-16 custom-scrollbar">
+          <DndContext sensors={sensors} collisionDetection={closestCenter} onDragStart={handleDragStart} onDragOver={handleDragOver} onDragEnd={handleDragEnd}>
+            <div className="board-texture p-16 rounded-[5rem] border border-gray-200 flex flex-col gap-12 min-w-fit shadow-2xl relative">
+              {CATEGORIES.map(cat => (
+                <BoardRow key={cat.id} id={cat.id} label={cat.label} subLabel={cat.subLabel} board={board} onDeleteCard={deleteCard} />
+              ))}
+            </div>
+
+            <aside className="fixed right-0 top-0 w-80 h-screen bg-white/95 backdrop-blur-xl border-l border-gray-100 shadow-[-15px_0_40px_rgba(0,0,0,0.05)] z-[90] flex flex-col">
+              <div className="p-10 border-b border-gray-50">
+                <h3 className="text-[12px] font-black uppercase tracking-[0.4em] text-gray-400 mb-2">Component Pool</h3>
+                <p className="text-[11px] text-gray-400 font-medium italic opacity-70">Infinite Architect Palette</p>
+              </div>
+              <div className="flex-1 overflow-y-auto p-8 custom-scrollbar space-y-4 pb-24">
+                <SortableContext items={board.pool.map(c => c.id)} strategy={verticalListSortingStrategy}>
+                  {board.pool.map(card => (
+                    <DraggableCard key={card.id} id={card.id} text={card.text} />
+                  ))}
+                </SortableContext>
+              </div>
+            </aside>
+
+            <DragOverlay dropAnimation={null}>
+              {activeCard && (
+                <div className="px-10 py-5 bg-white border-2 border-[#1e2d4d] text-[#1e2d4d] rounded-2xl shadow-[0_40px_80px_-15px_rgba(0,0,0,0.3)] font-bold transform rotate-6 min-w-[180px] text-center scale-110">
+                  {activeCard.text}
+                </div>
+              )}
+            </DragOverlay>
+          </DndContext>
+        </main>
+      </div>
+
+      {showShareModal && (
+        <div className="fixed inset-0 z-[200] bg-[#1e2d4d]/70 backdrop-blur-xl flex items-center justify-center p-8 animate-in fade-in duration-500">
+          <div className="bg-white w-full max-w-2xl rounded-[4rem] shadow-2xl p-14 relative animate-in zoom-in duration-500">
+            <button onClick={() => setShowShareModal(false)} className="absolute top-10 right-10 p-4 text-gray-400 hover:bg-gray-100 rounded-full transition-colors"><X className="w-7 h-7" /></button>
+            
+            <div className="mb-12 text-center">
+              <h2 className="text-4xl font-black text-[#1e2d4d] mb-3">Share Your Architecture</h2>
+              <p className="text-gray-500 font-medium text-lg">Send this board to your team or client.</p>
+            </div>
+
+            <div className="space-y-10">
+              <div className="group">
+                <label className="text-[11px] font-black uppercase tracking-[0.3em] text-gray-400 mb-4 block group-hover:text-[#1e6fb3] transition-colors">Direct Link (Best for Web)</label>
+                <div className="flex gap-4">
+                  <input readOnly value={shareLink} className="flex-1 bg-gray-50 border border-gray-200 rounded-3xl px-7 py-5 text-sm text-gray-600 outline-none focus:ring-4 focus:ring-[#1e6fb3]/10" />
+                  <button onClick={() => copy(shareLink, 'link')} className={`px-10 rounded-3xl transition-all shadow-xl ${copiedType === 'link' ? 'bg-green-500 text-white' : 'bg-[#1e6fb3] text-white hover:bg-[#165a94] transform active:scale-95'}`}>
+                    {copiedType === 'link' ? <Check className="w-6 h-6" /> : <Copy className="w-6 h-6" />}
+                  </button>
+                </div>
+              </div>
+
+              <div className="p-8 bg-[#f8fafc] rounded-[2.5rem] border border-gray-100">
+                <label className="text-[11px] font-black uppercase tracking-[0.3em] text-[#1e6fb3] mb-4 block">Board Transfer ID (For Preview Mode)</label>
+                <div className="flex gap-4">
+                  <input readOnly value={boardCode || ''} className="flex-1 bg-white border border-gray-200 rounded-2xl px-7 py-5 text-sm font-mono outline-none" />
+                  <button onClick={() => copy(boardCode || '', 'code')} className={`px-10 rounded-2xl transition-all shadow-xl ${copiedType === 'code' ? 'bg-green-500 text-white' : 'bg-[#1e6fb3] text-white hover:bg-[#165a94] transform active:scale-95'}`}>
+                    {copiedType === 'code' ? <Check className="w-6 h-6" /> : <Copy className="w-6 h-6" />}
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-12 pt-10 border-t border-gray-100 flex justify-center">
+              <a href="https://github.com" target="_blank" rel="noreferrer" className="flex items-center gap-3 text-sm font-black text-gray-400 hover:text-[#1e2d4d] transition-colors uppercase tracking-widest">
+                Host this board on GitHub Pages <ExternalLink className="w-5 h-5" />
+              </a>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default App;
